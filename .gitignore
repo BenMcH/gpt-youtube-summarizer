@@ -1,0 +1,4 @@
+output/*.json
+output/*.txt
+input.en.vtt
+node_modules
