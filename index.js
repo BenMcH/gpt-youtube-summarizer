@@ -1,6 +1,23 @@
 import openai from 'openai'
 import fs from 'fs/promises';
+import fsSync from 'fs';
+import cheerio from 'cheerio'
 import { exec } from 'child_process';
+
+const invariant = (condition, message) => {
+	if (!condition) {
+		throw new Error(message);
+	}
+};
+
+const apiKey = process.env.OPENAI_API_KEY
+invariant(apiKey, 'No OpenAI API key found')
+
+const config = new openai.Configuration({
+	apiKey
+})
+
+const openAiClient = new openai.OpenAIApi(config);
 
 const runCommand = (command) => {
 	return new Promise((resolve, reject) => {
@@ -14,76 +31,121 @@ const runCommand = (command) => {
 	});
 };
 
-await runCommand(`yt-dlp --write-subs --sub-lang en --skip-download --sub-format srt -o 'input.%(ext)s' ${process.argv[2]}`)
-const uniq = Date.now();
+/**
+ * 
+ * @param {string} url 
+ * @param {string} uniq 
+ * @returns {Promise<string>}
+ */
+const downloadSubs = async (url, uniq) => {
+	await runCommand(`yt-dlp --write-subs --write-auto-subs --sub-lang en --skip-download --sub-format ttml -o './output/${uniq}.%(ext)s' ${url}`);
 
-const config = new openai.Configuration({
-	apiKey: process.env.OPENAI_API_KEY
-})
-const api = new openai.OpenAIApi(config);
-const file = await fs.readFile('./input.en.vtt')
+	const input = await fs.readFile(`./output/${uniq}.en.ttml`, 'utf8');
 
-const lines = file.toString().split("\n");
+	const $ = cheerio.load(input, { xmlMode: true });
+	const ps = $('p');
 
-const firstBlank = lines.indexOf('');
-const withoutHeaders = lines.slice(firstBlank);
-const withoutTimestamps = withoutHeaders.filter(line => !line.match(/^\d{2}:\d{2}:\d{2}.\d{3}\s*-->/) && !line.includes('<c>') && line.replace(/\s*/g, '').length > 0);
+	let str = '';
 
-const withoutRepeats = withoutTimestamps.filter((line, index) => index > 0 && withoutTimestamps[index] != withoutTimestamps[index - 1])
+	for (let p of ps) {
+		str += ' ' + $(p).text();
+	}
+	return str;
+}
 
-await fs.writeFile(`output-${uniq}.txt`, withoutRepeats.join('\n'))
-
-const AVG_TOKENS_PER_LINE = withoutRepeats.map(line => line.length / 4).reduce((total, acc) => total + acc) / withoutRepeats.length;
-const TARGET_TOKENS = 2000;
-const SLICE_LINES = TARGET_TOKENS / AVG_TOKENS_PER_LINE;
-const STEP_LINES = SLICE_LINES / 1.25;
-
-let page = 0;
-let responses = [];
-
-while (page * STEP_LINES < withoutRepeats.length) {
-	const start = page * STEP_LINES;
-	const end = start + SLICE_LINES;
-	const prompt = withoutRepeats.slice(start, end).join("\n");
-
-	const response = api.createChatCompletion({
+/**
+ * 
+ * @param {string} systemPrompt 
+ * @param {string} userPrompt 
+ * @returns {string}
+ */
+const chatCompletion = async (systemPrompt, userPrompt) => {
+	return openAiClient.createChatCompletion({
 		model: 'gpt-3.5-turbo',
 		messages: [
 			{
 				role: 'system',
-				content: 'you are a helpful ai companion whose goal is to ingest transcribed speech from youtube videos and return a condensed summary of that section\'s information. Interesting facts and takeaways should be prioritized in these summaries'
+				content: systemPrompt
 			},
 			{
 				role: 'user',
-				content: prompt
+				content: userPrompt
 			}
 		]
 	}).then(response => response.data.choices[0].message.content)
-
-	responses.push(response)
-
-	page += 1
 }
 
-const answers = await Promise.all(responses);
+/**
+ * 
+ * @param {string} input 
+ * @returns {Promise<string[]>}
+ */
+const summarizeParts = async (input) => {
+	const words = input.match(/[^\s]+/g);
+	const AVG_TOKENS_PER_WORD = words.map(w => w.length / 4).reduce((a, b) => a + b, 0) / words.length;
+	const TARGET_TOKENS = 3750;
+	const SLICE_WORDS = Math.ceil(TARGET_TOKENS / AVG_TOKENS_PER_WORD);
+	const STEP_WORDS = Math.ceil(SLICE_WORDS / 1.25);
 
-await fs.writeFile(`all_summaries-${uniq}.json`, JSON.stringify(answers));
+	let page = 0;
+	let responses = [];
+
+	while (page * STEP_WORDS < words.length) {
+		const start = page * STEP_WORDS;
+		const end = start + SLICE_WORDS;
+		const prompt = words.slice(start, end).join(" ").trim();
+
+		const response = chatCompletion(
+			'you are a helpful ai companion whose goal is to ingest transcribed speech and return a condensed summary of that section\'s information. Interesting facts and takeaways should be prioritized in these summaries. Because these are automatically generated transcriptions, there may be some errors (such as misspellings) in the text. Please do your best to correct these errors while retaining the original meaning of the text. There may also be sponsored messages in the transcriptions that advertise products or services, please remove these from the summary.',
+			prompt
+		)
+
+		responses.push(response)
+
+		page += 1
+	}
+
+	return Promise.all(responses);
+}
+
+/**
+ * 
+ * @param {string} video 
+ * @returns {Promise<void>}
+ */
+const extractValue = async (video) => {
+	const url = video;
+	const uniq = new URLSearchParams(url.split('?')[1]).get('v')
+
+	if (fsSync.existsSync(`./output/final_summary-${uniq}.json`)) {
+		const file = await fs.readFile(`./output/final_summary-${uniq}.json`)
+		console.log(JSON.parse(file.toString()))
+		return;
+	}
+
+	let summaries;
+
+	if (fsSync.existsSync(`./output/all_summaries-${uniq}.json`)) {
+		summaries = JSON.parse((await fs.readFile(`./output/all_summaries-${uniq}.json`)).toString());
+	} else {
+		invariant(uniq, 'No video id found')
+		let str = await downloadSubs();
+
+		await fs.writeFile(`./output/output-${uniq}.txt`, str)
+		summaries = await summarizeParts(str);
+	}
+
+	await fs.writeFile(`./output/all_summaries-${uniq}.json`, JSON.stringify(summaries));
+
+	const response = await chatCompletion(
+		'you are a helpful ai companion whose goal is to write a short blog post in markdown about the information presented to you. there may be duplicated information among the sections, so be sure to remove any of those that may be encountered while retaining as much unique information and interesting facts as possible. output should be delivered in paragraph form using markdown formatting and be between 2 and 8 paragraphs depending on the content received'
+			`SUMMARY: ${summaries.join("\n\nSUMMARY:\n")}`
+	);
+
+	await fs.writeFile(`./output/final_summary-${uniq}.txt`, response)
+
+	console.log(response)
+}
 
 
-const response = await api.createChatCompletion({
-	model: 'gpt-3.5-turbo',
-	messages: [
-		{
-			role: 'system',
-			content: 'you are a helpful ai companion whose goal is to summarize a collection of summaries generated from overlapping sections of captions. there may be duplicated information among the sections, so be sure to remove any of those that may be encountered while retaining as much unique information and interesting facts as possible. output should be delivered in paragraph form and be between 1 and 5 paragraphs depending on the content received'
-		},
-		{
-			role: 'user',
-			content: `SUMMARY: ${answers.join("\n\nSUMMARY:\n")}`
-		}
-	]
-})
-
-await fs.writeFile(`final_summary-${uniq}.json`, JSON.stringify(response.data.choices[0].message.content))
-
-console.log(response.data.choices[0].message.content)
+await extractValue(process.argv[2])

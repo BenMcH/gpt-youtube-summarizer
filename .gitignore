@@ -1,4 +1,4 @@
-output/*.json
-output/*.txt
+!output/.gitkeep
+output/*
 input.en.vtt
 node_modules
