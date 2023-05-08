@@ -1,13 +1,25 @@
+// @ts-check
+
 import openai from 'openai'
 import fs from 'fs/promises';
 import fsSync from 'fs';
 import cheerio from 'cheerio'
 import { exec } from 'child_process';
 
+const TARGET_TOKENS = 3500;
+
+/**
+ * 
+ * @param {unknown} condition 
+ * @param {string?} message 
+ * @returns {asserts condition}
+ */
 const invariant = (condition, message) => {
-	if (!condition) {
-		throw new Error(message);
+	if (condition) {
+		return;
 	}
+
+	throw new Error(message || 'Invariant failed');
 };
 
 const apiKey = process.env.OPENAI_API_KEY
@@ -18,6 +30,13 @@ const config = new openai.Configuration({
 })
 
 const openAiClient = new openai.OpenAIApi(config);
+
+/**
+ * 
+ * @param {string} str 
+ * @returns {number}
+ */
+const tokens = (str) => Math.ceil(str.length / 4)
 
 const runCommand = (command) => {
 	return new Promise((resolve, reject) => {
@@ -50,6 +69,7 @@ const downloadSubs = async (url, uniq) => {
 	for (let p of ps) {
 		str += ' ' + $(p).text();
 	}
+
 	return str;
 }
 
@@ -57,7 +77,7 @@ const downloadSubs = async (url, uniq) => {
  * 
  * @param {string} systemPrompt 
  * @param {string} userPrompt 
- * @returns {string}
+ * @returns {Promise<string | undefined>}
  */
 const chatCompletion = async (systemPrompt, userPrompt) => {
 	return openAiClient.createChatCompletion({
@@ -72,18 +92,20 @@ const chatCompletion = async (systemPrompt, userPrompt) => {
 				content: userPrompt
 			}
 		]
-	}).then(response => response.data.choices[0].message.content)
+	}).then(response => response.data.choices[0].message?.content)
 }
 
 /**
  * 
  * @param {string} input 
- * @returns {Promise<string[]>}
+ * @returns {Promise<Array<string | undefined>>}
  */
 const summarizeParts = async (input) => {
 	const words = input.match(/[^\s]+/g);
+	if (!words) {
+		return [];
+	}
 	const AVG_TOKENS_PER_WORD = words.map(w => w.length / 4).reduce((a, b) => a + b, 0) / words.length;
-	const TARGET_TOKENS = 3750;
 	const SLICE_WORDS = Math.ceil(TARGET_TOKENS / AVG_TOKENS_PER_WORD);
 	const STEP_WORDS = Math.ceil(SLICE_WORDS / 1.25);
 
@@ -129,7 +151,7 @@ const extractValue = async (video) => {
 		summaries = JSON.parse((await fs.readFile(`./output/all_summaries-${uniq}.json`)).toString());
 	} else {
 		invariant(uniq, 'No video id found')
-		let str = await downloadSubs();
+		let str = await downloadSubs(url, uniq)
 
 		await fs.writeFile(`./output/output-${uniq}.txt`, str)
 		summaries = await summarizeParts(str);
@@ -137,15 +159,41 @@ const extractValue = async (video) => {
 
 	await fs.writeFile(`./output/all_summaries-${uniq}.json`, JSON.stringify(summaries));
 
+	summaries = summaries.map(s => `SUMMARY: ${s}`)
+
+	let totalTokens = summaries.map(tokens).reduce((a, b) => a + b, 0);
+
+	while (totalTokens > TARGET_TOKENS) {
+		console.log("unable to summarize in one pass, trying to further simplify");
+		let tokenCount = 0;
+		let summaryIndex = 0;
+		let summariesToSummarize = [];
+
+		while (tokenCount < TARGET_TOKENS) {
+			tokenCount += tokens(summaries[summaryIndex]);
+			summariesToSummarize.push(summaries[summaryIndex]);
+			summaryIndex += 1;
+		}
+
+		const response = await chatCompletion(
+			'you are a helpful ai whose goal is to receive several summaries of information from adjacent transcriptions from the same source material and create a more succinct summary of the information presented.',
+			summariesToSummarize.join('\n\n')
+		);
+
+		summaries.splice(0, summaryIndex, response);
+		totalTokens = summaries.map(tokens).reduce((a, b) => a + b, 0);
+	}
+
 	const response = await chatCompletion(
-		'you are a helpful ai companion whose goal is to write a short blog post in markdown about the information presented to you. there may be duplicated information among the sections, so be sure to remove any of those that may be encountered while retaining as much unique information and interesting facts as possible. output should be delivered in paragraph form using markdown formatting and be between 2 and 8 paragraphs depending on the content received'
-			`SUMMARY: ${summaries.join("\n\nSUMMARY:\n")}`
+		'you are a helpful ai companion whose goal is to write a short blog post in markdown about the information presented to you. there may be duplicated information among the sections, so be sure to remove any of those that may be encountered while retaining as much unique information and interesting facts as possible. output should be delivered in paragraph form using markdown formatting and be between 2 and 8 paragraphs depending on the content received',
+		summaries.join('\n\n')
 	);
+
+	invariant(response, 'No response found');
 
 	await fs.writeFile(`./output/final_summary-${uniq}.txt`, response)
 
 	console.log(response)
 }
-
 
 await extractValue(process.argv[2])
