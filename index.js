@@ -8,8 +8,19 @@ import { exec } from 'child_process';
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { PutCommand, GetCommand, DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 
+const packageJson = JSON.parse(await fs.readFile('./package.json', 'utf8'));
+
+/**
+ * 
+ * @type {{[key: string]: string | undefined}}}
+ */
+const prompts = packageJson.prompts || {};
+
 const TARGET_TOKENS = 3500;
+const TOKEN_SAFTY_NET = 0.9
 const TABLE_NAME = process.env.DYNAMO_TABLE || 'openai-summaries';
+const SUMMARIZATION_OVERLAP = 0.2;
+const SUMMARIZATION_OVERLAP_RATIO = 1 - SUMMARIZATION_OVERLAP;
 
 const client = new DynamoDBClient({ region: process.env.REGION || 'us-east-1' });
 const ddbDocClient = DynamoDBDocumentClient.from(client);
@@ -133,28 +144,34 @@ const summarizeParts = async (input) => {
 
 	let responses = [];
 
+	const systemPrompt = prompts.PARTIAL_SUMMARY;
+
+	invariant(typeof systemPrompt === 'string', 'Invalid system prompt');
+
+	const systemPromptTokens = tokens(systemPrompt);
+	const target = (TARGET_TOKENS - systemPromptTokens) * TOKEN_SAFTY_NET;
+
 	while (start < words.length) {
 		end += 1;
 		const prompt = words.slice(start, end).join(" ").trim();
 
 		const tokenCount = tokens(prompt);
 
-		if (tokenCount > TARGET_TOKENS * 0.8 || end >= words.length) {
-			const systemPrompt = 'you are a helpful ai companion whose goal is to ingest transcribed speech and return a condensed summary of that section\'s information. Interesting facts and takeaways should be prioritized in these summaries. Because these are automatically generated transcriptions, there may be some errors (such as misspellings) in the text. Please do your best to correct these errors while retaining the original meaning of the text. There may also be sponsored messages in the transcriptions that advertise products or services, please remove these from the summary.';
-			const response = chatCompletion(
-				systemPrompt,
-				prompt
-			)
+		if (tokenCount < target && end < words.length) continue;
 
-			responses.push(response)
+		const response = chatCompletion(
+			systemPrompt,
+			prompt
+		)
 
-			if (tokenCount < TARGET_TOKENS * 0.8) {
-				break;
-			}
+		responses.push(response)
 
-			start += (end - start) * 0.8;
-			end = start;
+		if (tokenCount < target) {
+			break;
 		}
+
+		start += (end - start) * SUMMARIZATION_OVERLAP_RATIO;
+		end = start;
 	}
 
 	return Promise.all(responses);
@@ -185,7 +202,6 @@ const extractValue = async (video) => {
 		summaries = await summarizeParts(str);
 	}
 
-	// await fs.writeFile(`./output/all_summaries-${uniq}.json`, JSON.stringify(summaries));
 	await putStringToDynamo(`all-summaries-${uniq}`, summaries.join('\n\n'));
 
 	summaries = summaries.map(s => `SUMMARY: ${s}`)
@@ -204,8 +220,11 @@ const extractValue = async (video) => {
 			summaryIndex += 1;
 		}
 
+		const systemPrompt = prompts.INTERMEDIATE_SUMMARY;
+		invariant(typeof systemPrompt === 'string', 'Invalid system prompt');
+
 		const response = await chatCompletion(
-			'you are a helpful ai whose goal is to receive several summaries of information from adjacent transcriptions from the same source material and create a more succinct summary of the information presented.',
+			systemPrompt,
 			summariesToSummarize.join('\n\n')
 		);
 
@@ -213,8 +232,10 @@ const extractValue = async (video) => {
 		totalTokens = summaries.map(tokens).reduce((a, b) => a + b, 0);
 	}
 
+	const systemPrompt = prompts.FINAL_SUMMARY;
+	invariant(typeof systemPrompt === 'string', 'Invalid system prompt');
 	const response = await chatCompletion(
-		'you are a helpful ai companion whose goal is to write a short blog post in markdown about the information presented to you. there may be duplicated information among the sections, so be sure to remove any of those that may be encountered while retaining as much unique information and interesting facts as possible. output should be delivered in paragraph form using markdown formatting and be between 2 and 8 paragraphs depending on the content received',
+		systemPrompt,
 		summaries.join('\n\n')
 	);
 
