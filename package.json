@@ -11,6 +11,8 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.335.0",
+    "@aws-sdk/lib-dynamodb": "^3.335.0",
     "cheerio": "^1.0.0-rc.12",
     "openai": "^3.2.1"
   }

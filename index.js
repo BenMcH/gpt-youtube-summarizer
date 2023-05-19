@@ -1,12 +1,18 @@
 // @ts-check
 
-import openai from 'openai'
+import openai from 'openai';
 import fs from 'fs/promises';
-import fsSync from 'fs';
-import cheerio from 'cheerio'
+import cheerio from 'cheerio';
 import { exec } from 'child_process';
 
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { PutCommand, GetCommand, DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
+
 const TARGET_TOKENS = 3500;
+const TABLE_NAME = process.env.DYNAMO_TABLE || 'openai-summaries';
+
+const client = new DynamoDBClient({ region: process.env.REGION || 'us-east-1' });
+const ddbDocClient = DynamoDBDocumentClient.from(client);
 
 /**
  * 
@@ -27,7 +33,7 @@ invariant(apiKey, 'No OpenAI API key found')
 
 const config = new openai.Configuration({
 	apiKey
-})
+});
 
 const openAiClient = new openai.OpenAIApi(config);
 
@@ -77,9 +83,13 @@ const downloadSubs = async (url, uniq) => {
  * 
  * @param {string} systemPrompt 
  * @param {string} userPrompt 
- * @returns {Promise<string | undefined>}
+ * @returns {Promise<string>}
  */
 const chatCompletion = async (systemPrompt, userPrompt) => {
+	const systemTokens = tokens(systemPrompt);
+	const userTokens = tokens(userPrompt);
+	console.log({ systemTokens, userTokens, totalTokens: systemTokens + userTokens })
+
 	return openAiClient.createChatCompletion({
 		model: 'gpt-3.5-turbo',
 		messages: [
@@ -92,39 +102,59 @@ const chatCompletion = async (systemPrompt, userPrompt) => {
 				content: userPrompt
 			}
 		]
-	}).then(response => response.data.choices[0].message?.content)
+	}).then(response => {
+		const msg = response.data.choices[0].message?.content
+
+		if (!msg) {
+			throw new Error('No message found')
+		}
+
+		return msg;
+	}).catch(e => {
+		console.error(e)
+		console.log({ systemPrompt, userPrompt })
+		throw e;
+	})
 }
 
 /**
  * 
  * @param {string} input 
- * @returns {Promise<Array<string | undefined>>}
+ * @returns {Promise<Array<string>>}
  */
 const summarizeParts = async (input) => {
 	const words = input.match(/[^\s]+/g);
 	if (!words) {
 		return [];
 	}
-	const AVG_TOKENS_PER_WORD = words.map(w => w.length / 4).reduce((a, b) => a + b, 0) / words.length;
-	const SLICE_WORDS = Math.ceil(TARGET_TOKENS / AVG_TOKENS_PER_WORD);
-	const STEP_WORDS = Math.ceil(SLICE_WORDS / 1.25);
 
-	let page = 0;
+	let start = 0;
+	let end = 0;
+
 	let responses = [];
 
-	while (page * STEP_WORDS < words.length) {
-		const start = page * STEP_WORDS;
-		const end = start + SLICE_WORDS;
+	while (start < words.length) {
+		end += 1;
 		const prompt = words.slice(start, end).join(" ").trim();
 
-		const response = chatCompletion(
-			'you are a helpful ai companion whose goal is to ingest transcribed speech and return a condensed summary of that section\'s information. Interesting facts and takeaways should be prioritized in these summaries. Because these are automatically generated transcriptions, there may be some errors (such as misspellings) in the text. Please do your best to correct these errors while retaining the original meaning of the text. There may also be sponsored messages in the transcriptions that advertise products or services, please remove these from the summary.',
-			prompt
-		)
+		const tokenCount = tokens(prompt);
 
-		responses.push(response)
+		if (tokenCount > TARGET_TOKENS * 0.8 || end >= words.length) {
+			const systemPrompt = 'you are a helpful ai companion whose goal is to ingest transcribed speech and return a condensed summary of that section\'s information. Interesting facts and takeaways should be prioritized in these summaries. Because these are automatically generated transcriptions, there may be some errors (such as misspellings) in the text. Please do your best to correct these errors while retaining the original meaning of the text. There may also be sponsored messages in the transcriptions that advertise products or services, please remove these from the summary.';
+			const response = chatCompletion(
+				systemPrompt,
+				prompt
+			)
 
-		page += 1
+			responses.push(response)
+
+			if (tokenCount < TARGET_TOKENS * 0.8) {
+				break;
+			}
+
+			start += (end - start) * 0.8;
+			end = start;
+		}
 	}
 
 	return Promise.all(responses);
@@ -139,17 +169,15 @@ const extractValue = async (video) => {
 	const url = video;
 	const uniq = new URLSearchParams(url.split('?')[1]).get('v')
 
-	if (fsSync.existsSync(`./output/final_summary-${uniq}.json`)) {
-		const file = await fs.readFile(`./output/final_summary-${uniq}.json`)
-		console.log(JSON.parse(file.toString()))
+	const finalSummary = await getStringFromDynamo(`final-summary-${uniq}`);
+	if (finalSummary !== undefined) {
+		console.log(finalSummary)
 		return;
 	}
 
-	let summaries;
+	let summaries = (await getStringFromDynamo(`all-summaries-${uniq}`))?.split('\n\n');
 
-	if (fsSync.existsSync(`./output/all_summaries-${uniq}.json`)) {
-		summaries = JSON.parse((await fs.readFile(`./output/all_summaries-${uniq}.json`)).toString());
-	} else {
+	if (!summaries) {
 		invariant(uniq, 'No video id found')
 		let str = await downloadSubs(url, uniq)
 
@@ -157,7 +185,8 @@ const extractValue = async (video) => {
 		summaries = await summarizeParts(str);
 	}
 
-	await fs.writeFile(`./output/all_summaries-${uniq}.json`, JSON.stringify(summaries));
+	// await fs.writeFile(`./output/all_summaries-${uniq}.json`, JSON.stringify(summaries));
+	await putStringToDynamo(`all-summaries-${uniq}`, summaries.join('\n\n'));
 
 	summaries = summaries.map(s => `SUMMARY: ${s}`)
 
@@ -191,9 +220,43 @@ const extractValue = async (video) => {
 
 	invariant(response, 'No response found');
 
-	await fs.writeFile(`./output/final_summary-${uniq}.txt`, response)
+	await putStringToDynamo(`final-summary-${uniq}`, response);
 
 	console.log(response)
 }
+
+/**
+ * 
+ * @param {string} key 
+ * @returns {Promise<string | undefined>}
+ */
+const getStringFromDynamo = async (key) => {
+	const { Item } = await ddbDocClient.send(new GetCommand({
+		TableName: TABLE_NAME,
+		Key: {
+			key
+		}
+	}));
+
+
+	return Item?.value;
+}
+
+/**
+ * 
+ * @param {string} key
+ * @param {string} value
+ * @returns {Promise<void>}
+ */
+const putStringToDynamo = async (key, value) => {
+	await ddbDocClient.send(new PutCommand({
+		TableName: TABLE_NAME,
+		Item: {
+			key,
+			value
+		}
+	}));
+}
+
 
 await extractValue(process.argv[2])
