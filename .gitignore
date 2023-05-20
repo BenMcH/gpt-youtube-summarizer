@@ -2,3 +2,4 @@
 output/*
 input.en.vtt
 node_modules
+infra/.terraform

@@ -5,25 +5,24 @@ import fs from 'fs/promises';
 import cheerio from 'cheerio';
 import { exec } from 'child_process';
 
-import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { PutCommand, GetCommand, DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
+import {
+	S3Client,
+	GetObjectCommand,
+	PutObjectCommand,
+	ListObjectsCommand
+} from "@aws-sdk/client-s3";
 
-const packageJson = JSON.parse(await fs.readFile('./package.json', 'utf8'));
+import packageJson from './package.json' assert { type: "json" };
 
-/**
- * 
- * @type {{[key: string]: string | undefined}}}
- */
-const prompts = packageJson.prompts || {};
+const prompts = packageJson.prompts;
 
+const BUCKET = 'mchonedev-gpt-summarizer';
 const TARGET_TOKENS = 3500;
 const TOKEN_SAFTY_NET = 0.9
-const TABLE_NAME = process.env.DYNAMO_TABLE || 'openai-summaries';
 const SUMMARIZATION_OVERLAP = 0.2;
 const SUMMARIZATION_OVERLAP_RATIO = 1 - SUMMARIZATION_OVERLAP;
 
-const client = new DynamoDBClient({ region: process.env.REGION || 'us-east-1' });
-const ddbDocClient = DynamoDBDocumentClient.from(client);
+const client = new S3Client({ region: process.env.REGION || 'us-east-1' });
 
 /**
  * 
@@ -146,8 +145,6 @@ const summarizeParts = async (input) => {
 
 	const systemPrompt = prompts.PARTIAL_SUMMARY;
 
-	invariant(typeof systemPrompt === 'string', 'Invalid system prompt');
-
 	const systemPromptTokens = tokens(systemPrompt);
 	const target = (TARGET_TOKENS - systemPromptTokens) * TOKEN_SAFTY_NET;
 
@@ -186,13 +183,13 @@ const extractValue = async (video) => {
 	const url = video;
 	const uniq = new URLSearchParams(url.split('?')[1]).get('v')
 
-	const finalSummary = await getStringFromDynamo(`final-summary-${uniq}`);
+	const finalSummary = await getObjectFromS3(`final-summary-${uniq}`);
 	if (finalSummary !== undefined) {
 		console.log(finalSummary)
 		return;
 	}
 
-	let summaries = (await getStringFromDynamo(`all-summaries-${uniq}`))?.split('\n\n');
+	let summaries = (await getObjectFromS3(`all-summaries-${uniq}`))?.split('\n\n');
 
 	if (!summaries) {
 		invariant(uniq, 'No video id found')
@@ -202,7 +199,7 @@ const extractValue = async (video) => {
 		summaries = await summarizeParts(str);
 	}
 
-	await putStringToDynamo(`all-summaries-${uniq}`, summaries.join('\n\n'));
+	await putObjectToS3(`all-summaries-${uniq}`, summaries.join('\n\n'));
 
 	summaries = summaries.map(s => `SUMMARY: ${s}`)
 
@@ -221,7 +218,6 @@ const extractValue = async (video) => {
 		}
 
 		const systemPrompt = prompts.INTERMEDIATE_SUMMARY;
-		invariant(typeof systemPrompt === 'string', 'Invalid system prompt');
 
 		const response = await chatCompletion(
 			systemPrompt,
@@ -233,7 +229,7 @@ const extractValue = async (video) => {
 	}
 
 	const systemPrompt = prompts.FINAL_SUMMARY;
-	invariant(typeof systemPrompt === 'string', 'Invalid system prompt');
+
 	const response = await chatCompletion(
 		systemPrompt,
 		summaries.join('\n\n')
@@ -241,9 +237,8 @@ const extractValue = async (video) => {
 
 	invariant(response, 'No response found');
 
-	await putStringToDynamo(`final-summary-${uniq}`, response);
-
 	console.log(response)
+	await putObjectToS3(`final-summary-${uniq}`, response);
 }
 
 /**
@@ -251,16 +246,22 @@ const extractValue = async (video) => {
  * @param {string} key 
  * @returns {Promise<string | undefined>}
  */
-const getStringFromDynamo = async (key) => {
-	const { Item } = await ddbDocClient.send(new GetCommand({
-		TableName: TABLE_NAME,
-		Key: {
-			key
-		}
+const getObjectFromS3 = async (key) => {
+	const { Contents } = await client.send(new ListObjectsCommand({
+		Bucket: BUCKET,
+		Prefix: key
 	}));
 
+	if (!Contents?.length) {
+		return;
+	}
 
-	return Item?.value;
+	const obj = await client.send(new GetObjectCommand({
+		Bucket: BUCKET,
+		Key: key
+	}));
+
+	return obj.Body?.transformToString('utf-8');
 }
 
 /**
@@ -269,13 +270,11 @@ const getStringFromDynamo = async (key) => {
  * @param {string} value
  * @returns {Promise<void>}
  */
-const putStringToDynamo = async (key, value) => {
-	await ddbDocClient.send(new PutCommand({
-		TableName: TABLE_NAME,
-		Item: {
-			key,
-			value
-		}
+const putObjectToS3 = async (key, value) => {
+	await client.send(new PutObjectCommand({
+		Bucket: BUCKET,
+		Key: key,
+		Body: value
 	}));
 }
 
