@@ -23,6 +23,11 @@ export const invariant = (condition, message) => {
  */
 export const tokens = (str) => Math.ceil(str.length / 4)
 
+/**
+ * 
+ * @param {string} command 
+ * @returns {Promise<{stdout: string, stderr: string}>}
+ */
 export const runCommand = (command) => {
 	return new Promise((resolve, reject) => {
 		exec(command, (error, stdout, stderr) => {

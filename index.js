@@ -1,12 +1,22 @@
 // @ts-check
 
 import fs from "fs/promises";
+import express from "express";
 
 import { getObjectFromS3, putObjectToS3 } from "./s3.js";
 import { invariant, tokens } from "./utils.js";
 import { downloadSubs } from "./yt-dlp.js";
 import { chatCompletion, recursivelySummarize, summarizeParts } from "./openai.js";
 import { TARGET_TOKENS, prompts } from "./constants.js";
+
+const app = express();
+
+app.get("/", async (req, res) => {
+	const url = req.query.url;
+	invariant(typeof url === "string", "No url found");
+	const summary = await extractValue(url);
+	res.send({ summary });
+});
 
 /**
  * 
@@ -27,10 +37,13 @@ const extractValue = async (video) => {
 
 	if (!summaries) {
 		invariant(uniq, "No video id found")
-		let str = await downloadSubs(url, uniq)
+		summaries = await downloadSubs(url, uniq).then(str => summarizeParts(str))
 
-		await fs.writeFile(`./output/output-${uniq}.txt`, str)
-		summaries = await summarizeParts(str);
+		if (!summaries || summaries?.length === 0) {
+			throw new Error("No summaries found")
+		}
+
+		await fs.writeFile(`./output/output-${uniq}.txt`, summaries)
 	}
 
 	let megaSummary = summaries.join("\n\n");
@@ -56,5 +69,12 @@ const extractValue = async (video) => {
 	await putObjectToS3(`final-summary-${uniq}`, finalSUmmary);
 }
 
+if (process.argv.length > 2) {
+	await extractValue(process.argv[2])
+	process.exit(0);
+}
 
-await extractValue(process.argv[2])
+app.listen(3000, () => {
+	console.log("Listening on port 3000");
+});
+
